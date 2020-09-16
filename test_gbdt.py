@@ -18,6 +18,8 @@ from sklearn.ensemble import GradientBoostingClassifier
 import sklearn.metrics as metrics
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.model_selection import GridSearchCV
+from sklearn.neighbors import KDTree
+from sklearn.neighbors import KNeighborsClassifier
 
 import matplotlib.cm as cm
 from sklearn.metrics import precision_recall_curve
@@ -28,6 +30,131 @@ canceData=load_breast_cancer()
 X=canceData.data
 y=canceData.target
 X_train,X_test,y_train,y_test=train_test_split(X,y,random_state=0,test_size=0.2)
+
+
+
+# Trust Score Class -- see paper NIPS18 (To Trust or Not to Trust a Classifier)
+class TrustScore:
+  """
+    Trust Score: a measure of classifier uncertainty based on nearest neighbors.
+  """
+
+  def __init__(self, k=10, alpha=0., filtering="none", min_dist=1e-12):
+    """
+        k and alpha are the tuning parameters for the filtering,
+        filtering: method of filtering. option are "none", "density",
+        "uncertainty"
+        min_dist: some small number to mitigate possible division by 0.
+    """
+    self.k = k
+    self.filtering = filtering
+    self.alpha = alpha
+    self.min_dist = min_dist
+
+  def filter_by_density(self, X):
+    """Filter out points with low kNN density.
+
+    Args:
+    X: an array of sample points.
+
+    Returns:
+    A subset of the array without points in the bottom alpha-fraction of
+    original points of kNN density.
+    """
+    kdtree = KDTree(X)
+    knn_radii = kdtree.query(X, k=self.k)[0][:, -1]
+    eps = np.percentile(knn_radii, (1 - self.alpha) * 100)
+    return X[np.where(knn_radii <= eps)[0], :]
+
+  def filter_by_uncertainty(self, X, y):
+    """Filter out points with high label disagreement amongst its kNN neighbors.
+
+    Args:
+    X: an array of sample points.
+
+    Returns:
+    A subset of the array without points in the bottom alpha-fraction of
+    samples with highest disagreement amongst its k nearest neighbors.
+    """
+    neigh = KNeighborsClassifier(n_neighbors=self.k)
+    neigh.fit(X, y)
+    confidence = neigh.predict_proba(X)
+    cutoff = np.percentile(confidence, self.alpha * 100)
+    unfiltered_idxs = np.where(confidence >= cutoff)[0]
+    return X[unfiltered_idxs, :], y[unfiltered_idxs]
+
+  def fit(self, X, y):
+    """Initialize trust score precomputations with training data.
+
+    WARNING: assumes that the labels are 0-indexed (i.e.
+    0, 1,..., n_labels-1).
+
+    Args:
+    X: an array of sample points.
+    y: corresponding labels.
+    """
+    self.n_labels = np.max(y) + 1
+    self.kdtrees = [None] * self.n_labels
+    if self.filtering == "uncertainty":
+      X_filtered, y_filtered = self.filter_by_uncertainty(X, y)
+    for label in range(self.n_labels):
+      if self.filtering == "none":
+        X_to_use = X[np.where(y == label)[0]]
+        self.kdtrees[label] = KDTree(X_to_use)
+      elif self.filtering == "density":
+        X_to_use = self.filter_by_density(X[np.where(y == label)[0]])
+        self.kdtrees[label] = KDTree(X_to_use)
+      elif self.filtering == "uncertainty":
+        X_to_use = X_filtered[np.where(y_filtered == label)[0]]
+        self.kdtrees[label] = KDTree(X_to_use)
+
+      if len(X_to_use) == 0:
+        print(
+            "Filtered too much or missing examples from a label! Please lower "
+            "alpha or check data.")
+
+  def get_score(self, X, y_pred):
+    """Compute the trust scores.
+
+    Given a set of points, determines the distance to each class.
+
+    Args:
+    X: an array of sample points.
+    y_pred: The predicted labels for these points.
+
+    Returns:
+    The trust score, which is ratio of distance to closest class that was not
+    the predicted class to the distance to the predicted class.
+    """
+    d = np.tile(None, (X.shape[0], self.n_labels))
+    for label_idx in range(self.n_labels):
+      d[:, label_idx] = self.kdtrees[label_idx].query(X, k=2)[0][:, -1]
+
+    sorted_d = np.sort(d, axis=1)
+    d_to_pred = d[range(d.shape[0]), y_pred]
+    d_to_closest_not_pred = np.where(sorted_d[:, 0] != d_to_pred,
+                                     sorted_d[:, 0], sorted_d[:, 1])
+    return d_to_closest_not_pred / (d_to_pred + self.min_dist)
+
+
+class KNNConfidence:
+  """Baseline which uses disagreement to kNN classifier.
+  """
+
+  def __init__(self, k=10):
+    self.k = k
+
+  def fit(self, X, y):
+    self.kdtree = KDTree(X)
+    self.y = y
+
+  def get_score(self, X, y_pred):
+    knn_idxs = self.kdtree.query(X, k=self.k)[1]
+    knn_outputs = self.y[knn_idxs]
+    return np.mean(
+        knn_outputs == np.transpose(np.tile(y_pred, (self.k, 1))), axis=1)
+
+
 
 
 # model definition    
@@ -53,8 +180,6 @@ def run_xgb_exa(X_train, y_train, X_test, y_test, get_training=False):
     auc = metrics.roc_auc_score(y_test,y_pred)    
     return acc, auc, run_time
 
-xgb_exa = run_xgb_exa(X_train, y_train, X_test, y_test, get_training=False)
-print(xgb_exa)
   
 def run_xgb_his(X_train, y_train, X_test, y_test, get_training=False):
     start_time = time.time()
@@ -66,8 +191,8 @@ def run_xgb_his(X_train, y_train, X_test, y_test, get_training=False):
     y_pred = model.predict(X_test)
     all_confidence = model.predict_proba(X_test)
     confidences = all_confidence[range(len(y_pred)), y_pred]
-    if not get_training:
-        return y_pred, confidences
+    #if not get_training:
+    #    return y_pred, confidences
     end_time = time.time()             
     run_time = end_time - start_time
     y_pred_training = model.predict(X_train)
@@ -77,13 +202,11 @@ def run_xgb_his(X_train, y_train, X_test, y_test, get_training=False):
     acc = metrics.accuracy_score(y_test,y_pred)
     auc = metrics.roc_auc_score(y_test,y_pred)    
     return acc, auc, run_time
-
-xgb_his = run_xgb_his(X_train, y_train, X_test, y_test, get_training=False)
-print(xgb_his)  
+  
 
 def run_lgb_baseline(X_train, y_train, X_test, y_test, get_training=False):
     start_time = time.time()
-    model = GradientBoostingClassifier(learning_rate=0.005, n_estimators=1000, max_depth=4, 
+    model = GradientBoostingClassifier(learning_rate=0.1, n_estimators=1000, max_depth=4, 
                                        min_samples_leaf = 10, min_samples_split = 81, 
                                        max_features=9, subsample=0.7, random_state = None)          
     model.fit(X_train, y_train)
@@ -102,13 +225,10 @@ def run_lgb_baseline(X_train, y_train, X_test, y_test, get_training=False):
     auc = metrics.roc_auc_score(y_test,y_pred)    
     return acc, auc, run_time
 
-lgb_base = run_lgb_baseline(X_train, y_train, X_test, y_test, get_training=False)
-print(lgb_base) 
-
 
 def run_lgb_SGB(X_train, y_train, X_test, y_test, get_training=False):
     start_time = time.time()
-    model = GradientBoostingClassifier(learning_rate=0.005, n_estimators=1000, max_depth=4, 
+    model = GradientBoostingClassifier(learning_rate=0.1, n_estimators=1000, max_depth=4, 
                                        min_samples_leaf = 10, min_samples_split = 81, 
                                        max_features=9, subsample=0.7, random_state=15 )          
     model.fit(X_train, y_train)
@@ -125,10 +245,7 @@ def run_lgb_SGB(X_train, y_train, X_test, y_test, get_training=False):
                                                 y_pred_training]
     acc = metrics.accuracy_score(y_test,y_pred)
     auc = metrics.roc_auc_score(y_test,y_pred)    
-    return acc, auc, run_time
-
-lgb_sgb = run_lgb_SGB(X_train, y_train, X_test, y_test, get_training=False)
-print(lgb_sgb) 
+    return acc, auc, run_time 
 
 
 def run_lightGBM(X_train, y_train, X_test, y_test, get_training=False):
@@ -143,8 +260,8 @@ def run_lightGBM(X_train, y_train, X_test, y_test, get_training=False):
     y_pred = model.predict(X_test)
     all_confidence = model.predict_proba(X_test)
     confidences = all_confidence[range(len(y_pred)), y_pred]
-    #if not get_training:
-    #    return y_pred, confidences
+    if not get_training:
+        return y_pred, confidences
     end_time = time.time()             
     run_time = end_time - start_time
     y_pred_training = model.predict(X_train)
@@ -154,9 +271,6 @@ def run_lightGBM(X_train, y_train, X_test, y_test, get_training=False):
     acc = metrics.accuracy_score(y_test,y_pred)
     auc = metrics.roc_auc_score(y_test,y_pred)    
     return acc, auc, run_time
-
-lgbm = run_lightGBM(X_train, y_train, X_test, y_test, get_training=False)
-print(lgbm)
 
 
 # plot graph       
@@ -294,16 +408,28 @@ def run_precision_recall_experiment_general(X,
   return (all_signal_names, final_TPs, final_stderrs, final_misclassification)
 
 
+# main function
+xgb_exa = run_xgb_exa(X_train, y_train, X_test, y_test, get_training=False)
+xgb_his = run_xgb_his(X_train, y_train, X_test, y_test, get_training=False)
+lgb_base = run_lgb_baseline(X_train, y_train, X_test, y_test, get_training=False)
+lgb_sgb = run_lgb_SGB(X_train, y_train, X_test, y_test, get_training=False)
+lgbm = run_lightGBM(X_train, y_train, X_test, y_test, get_training=False)
+print(xgb_exa,'\n',xgb_his,'\n',lgb_base,'\n',lgb_sgb,'\n',lgbm)
+
+kconfidence = KNNConfidence()
+trustscore = TrustScore()
 auc = run_precision_recall_experiment_general(X,
                                             y,
                                             20,
                                             [10,20,30,40,50,60,70,80,90,100],
-                                            run_xgb_his,
+                                            run_lightGBM,
                                             test_size=0.5,
-                                            extra_plot_title="",
-                                            signals=[],
-                                            signal_names=[],
+                                            extra_plot_title="LightGBM Precision Curve",
+                                            signals=[trustscore,kconfidence],
+                                            signal_names=["Trust Score","KNN Confidence"],
                                             predict_when_correct=False,
                                             skip_print=False)
+
+
 
 print(auc)
